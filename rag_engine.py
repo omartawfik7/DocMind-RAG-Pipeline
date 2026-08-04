@@ -1,0 +1,405 @@
+"""
+rag_engine.py — Core RAG Pipeline
+===================================
+Document ingestion -> chunking -> embedding -> vector store -> retrieval
+
+Pipeline:
+  1. PDF/TXT ingestion via PyPDF2
+  2. Recursive text chunking with overlap
+  3. Sentence-transformers embedding (all-MiniLM-L6-v2)
+  4. Qdrant Cloud vector store (persistent, hosted -- free tier)
+  5. Cosine similarity retrieval
+  6. Groq (Llama 3.3 70B) answer generation with citations
+
+Why Qdrant Cloud instead of local ChromaDB:
+  Render's free web-service tier does not support persistent disks, so
+  anything written to local disk (including a local ChromaDB store) is
+  not guaranteed to survive a restart or redeploy. Qdrant Cloud's free
+  tier is a real hosted database that persists independently of the app
+  server, so ingested documents survive restarts, redeploys, and the
+  free tier's spin-down/spin-up cycle.
+"""
+
+import os
+import re
+import uuid
+import hashlib
+from pathlib import Path
+from typing import Optional
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
+)
+from sentence_transformers import SentenceTransformer
+import PyPDF2
+from groq import Groq
+
+# -- Config ------------------------------------------------------
+EMBED_MODEL     = "all-MiniLM-L6-v2"
+EMBED_DIM       = 384       # output dimension of all-MiniLM-L6-v2
+CHUNK_SIZE      = 512       # characters per chunk
+CHUNK_OVERLAP   = 80        # overlap between chunks
+TOP_K           = 6         # number of chunks to retrieve
+GROQ_MODEL      = "llama-3.3-70b-versatile"
+COLLECTION_NAME = "documents"
+
+# Secrets come from environment variables -- never hardcode API keys.
+# Set GROQ_API_KEY, QDRANT_URL, and QDRANT_API_KEY in your host's
+# environment (locally: a .env file loaded by python-dotenv; on Render:
+# the service's Environment tab).
+GROQ_API_KEY   = os.environ["GROQ_API_KEY"]
+QDRANT_URL     = os.environ["QDRANT_URL"]
+QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
+
+_groq_client = Groq(api_key=GROQ_API_KEY)
+
+# -- Singleton client/model loaders -------------------------------
+_embedder: Optional[SentenceTransformer] = None
+_qdrant_client: Optional[QdrantClient] = None
+
+
+def get_embedder() -> SentenceTransformer:
+    global _embedder
+    if _embedder is None:
+        print("Loading embedding model (first run only)...")
+        _embedder = SentenceTransformer(EMBED_MODEL)
+    return _embedder
+
+
+def get_collection() -> QdrantClient:
+    """Returns a ready Qdrant client with the collection created if needed."""
+    global _qdrant_client
+    if _qdrant_client is None:
+        _qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        existing = {c.name for c in _qdrant_client.get_collections().collections}
+        if COLLECTION_NAME not in existing:
+            _qdrant_client.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+            )
+    return _qdrant_client
+
+
+def collection_count() -> int:
+    client = get_collection()
+    info = client.get_collection(COLLECTION_NAME)
+    return info.points_count or 0
+
+
+# ==================================================================
+#  DOCUMENT INGESTION
+# ==================================================================
+
+def extract_text_from_pdf(filepath: str) -> str:
+    """Extract full text from a PDF file."""
+    text_parts = []
+    with open(filepath, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
+        for page_num, page in enumerate(reader.pages):
+            text = page.extract_text() or ""
+            if text.strip():
+                text_parts.append(f"[Page {page_num + 1}]\n{text}")
+    return "\n\n".join(text_parts)
+
+
+def extract_text_from_txt(filepath: str) -> str:
+    """Extract text from a plain text file."""
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
+def extract_text(filepath: str) -> str:
+    """Route to correct extractor based on file extension."""
+    ext = Path(filepath).suffix.lower()
+    if ext == ".pdf":
+        return extract_text_from_pdf(filepath)
+    elif ext in [".txt", ".md"]:
+        return extract_text_from_txt(filepath)
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
+
+
+# ==================================================================
+#  TEXT CHUNKING
+# ==================================================================
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE,
+               overlap: int = CHUNK_OVERLAP) -> list[dict]:
+    """
+    Recursive character-level chunking with overlap.
+    Tries to split on paragraph breaks first, then sentence
+    boundaries, then falls back to hard character limit.
+
+    Returns list of dicts: {text, chunk_index, char_start, char_end}
+    """
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r" {2,}", " ", text)
+
+    chunks = []
+    start = 0
+    chunk_idx = 0
+
+    while start < len(text):
+        end = start + chunk_size
+
+        if end >= len(text):
+            chunk = text[start:]
+        else:
+            para_break = text.rfind("\n\n", start, end)
+            if para_break > start + chunk_size // 2:
+                end = para_break
+            else:
+                sent_break = max(
+                    text.rfind(". ", start, end),
+                    text.rfind(".\n", start, end),
+                    text.rfind("! ", start, end),
+                    text.rfind("? ", start, end),
+                )
+                if sent_break > start + chunk_size // 2:
+                    end = sent_break + 1
+            chunk = text[start:end]
+
+        chunk = chunk.strip()
+        if chunk:
+            chunks.append({
+                "text":        chunk,
+                "chunk_index": chunk_idx,
+                "char_start":  start,
+                "char_end":    start + len(chunk),
+            })
+            chunk_idx += 1
+
+        start = end - overlap
+        if start >= len(text):
+            break
+
+    return chunks
+
+
+# ==================================================================
+#  EMBEDDING + VECTOR STORE
+# ==================================================================
+
+def ingest_document(filepath: str, doc_name: str) -> dict:
+    """
+    Full ingestion pipeline:
+    extract -> chunk -> embed -> store in Qdrant Cloud
+
+    Returns summary dict.
+    """
+    client   = get_collection()
+    embedder = get_embedder()
+
+    # Check if already ingested (by file hash)
+    file_hash = hashlib.md5(open(filepath, "rb").read()).hexdigest()
+    existing, _ = client.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=Filter(must=[FieldCondition(key="file_hash", match=MatchValue(value=file_hash))]),
+        limit=1,
+    )
+    if existing:
+        count, _ = client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=Filter(must=[FieldCondition(key="file_hash", match=MatchValue(value=file_hash))]),
+            limit=10_000,
+        )
+        return {
+            "status":    "already_exists",
+            "doc_name":  doc_name,
+            "chunks":    len(count),
+            "file_hash": file_hash,
+        }
+
+    print(f"  Extracting text from: {doc_name}")
+    raw_text = extract_text(filepath)
+    if not raw_text.strip():
+        raise ValueError("No text could be extracted from this document.")
+
+    print(f"  Chunking text ({len(raw_text):,} chars)...")
+    chunks = chunk_text(raw_text)
+    print(f"  Created {len(chunks)} chunks")
+
+    print(f"  Embedding {len(chunks)} chunks...")
+    texts      = [c["text"] for c in chunks]
+    embeddings = embedder.encode(texts, show_progress_bar=False).tolist()
+
+    doc_id = str(uuid.uuid4())[:8]
+    points = []
+    for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+        points.append(PointStruct(
+            id=str(uuid.uuid4()),
+            vector=emb,
+            payload={
+                "text":        chunk["text"],
+                "doc_name":    doc_name,
+                "doc_id":      doc_id,
+                "file_hash":   file_hash,
+                "chunk_index": chunk["chunk_index"],
+                "char_start":  chunk["char_start"],
+                "char_end":    chunk["char_end"],
+            },
+        ))
+
+    client.upsert(collection_name=COLLECTION_NAME, points=points)
+    print(f"  Stored {len(chunks)} chunks for '{doc_name}'")
+
+    return {
+        "status":    "ingested",
+        "doc_name":  doc_name,
+        "doc_id":    doc_id,
+        "chunks":    len(chunks),
+        "chars":     len(raw_text),
+        "file_hash": file_hash,
+    }
+
+
+# ==================================================================
+#  RETRIEVAL
+# ==================================================================
+
+def retrieve(query: str, top_k: int = TOP_K,
+             doc_filter: Optional[str] = None) -> list[dict]:
+    """
+    Embed query -> cosine similarity search -> return top-k chunks
+    with metadata.
+    """
+    client   = get_collection()
+    embedder = get_embedder()
+
+    query_embedding = embedder.encode([query]).tolist()[0]
+
+    qfilter = None
+    if doc_filter:
+        qfilter = Filter(must=[FieldCondition(key="doc_name", match=MatchValue(value=doc_filter))])
+
+    results = client.query_points(
+        collection_name=COLLECTION_NAME,
+        query=query_embedding,
+        query_filter=qfilter,
+        limit=top_k,
+    ).points
+
+    chunks = []
+    for r in results:
+        chunks.append({
+            "text":        r.payload["text"],
+            "doc_name":    r.payload["doc_name"],
+            "chunk_index": r.payload["chunk_index"],
+            "score":       round(r.score, 4),
+        })
+
+    return chunks
+
+
+# ==================================================================
+#  ANSWER GENERATION (Groq / Llama 3.3 70B)
+# ==================================================================
+
+SYSTEM_PROMPT = """You are a precise document analyst. You answer questions strictly based on the provided document excerpts.
+
+Rules:
+- Answer only from the provided context. Do not use outside knowledge.
+- If the context doesn't contain enough information, say so clearly.
+- Always cite which document and chunk your answer comes from using [Source: doc_name, Chunk N].
+- Be concise but complete. Use bullet points for multi-part answers.
+- If quoting directly, use quotation marks and cite immediately after.
+"""
+
+def generate_answer(query: str, chunks: list[dict],
+                    chat_history: list[dict] = None) -> dict:
+    """
+    Build context from retrieved chunks -> call Groq -> return answer + sources.
+    """
+    if not chunks:
+        return {
+            "answer":  "No relevant content found in the uploaded documents.",
+            "sources": [],
+        }
+
+    context_parts = []
+    for i, chunk in enumerate(chunks):
+        context_parts.append(
+            f"[Excerpt {i+1} | Source: {chunk['doc_name']}, Chunk {chunk['chunk_index']} | Relevance: {chunk['score']}]\n"
+            f"{chunk['text']}"
+        )
+    context = "\n\n---\n\n".join(context_parts)
+
+    user_message = f"""Document excerpts:
+
+{context}
+
+---
+
+Question: {query}"""
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if chat_history:
+        for turn in chat_history[-6:]:
+            messages.append({"role": turn["role"], "content": turn["content"]})
+    messages.append({"role": "user", "content": user_message})
+
+    response = _groq_client.chat.completions.create(
+        model      = GROQ_MODEL,
+        max_tokens = 1024,
+        messages   = messages,
+    )
+
+    answer = response.choices[0].message.content
+
+    sources = []
+    seen    = set()
+    for chunk in chunks:
+        key = f"{chunk['doc_name']}::{chunk['chunk_index']}"
+        if key not in seen:
+            seen.add(key)
+            sources.append({
+                "doc_name":    chunk["doc_name"],
+                "chunk_index": chunk["chunk_index"],
+                "score":       chunk["score"],
+                "excerpt":     chunk["text"][:200] + "..." if len(chunk["text"]) > 200 else chunk["text"],
+            })
+
+    return {"answer": answer, "sources": sources}
+
+
+# ==================================================================
+#  DOCUMENT MANAGEMENT
+# ==================================================================
+
+def list_documents() -> list[dict]:
+    """Return all unique documents in the vector store."""
+    client = get_collection()
+    all_points, _ = client.scroll(collection_name=COLLECTION_NAME, limit=10_000, with_payload=True)
+    if not all_points:
+        return []
+
+    seen, docs = set(), []
+    counts = {}
+    for p in all_points:
+        doc_name = p.payload["doc_name"]
+        counts[doc_name] = counts.get(doc_name, 0) + 1
+        if doc_name not in seen:
+            seen.add(doc_name)
+            docs.append({"doc_name": doc_name, "doc_id": p.payload["doc_id"]})
+
+    for doc in docs:
+        doc["chunk_count"] = counts[doc["doc_name"]]
+
+    return docs
+
+
+def delete_document(doc_name: str) -> dict:
+    """Remove all chunks for a document from the vector store."""
+    client = get_collection()
+    matches, _ = client.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=Filter(must=[FieldCondition(key="doc_name", match=MatchValue(value=doc_name))]),
+        limit=10_000,
+    )
+    if not matches:
+        return {"status": "not_found", "doc_name": doc_name}
+
+    ids = [p.id for p in matches]
+    client.delete(collection_name=COLLECTION_NAME, points_selector=ids)
+    return {"status": "deleted", "doc_name": doc_name, "chunks_removed": len(ids)}

@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>DocMind — RAG Document Intelligence</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #262b36;
+    --text: #e6e8ec;
+    --muted: #8b93a5;
+    --accent: #5b8def;
+    --accent-dim: #2a3a5c;
+    --user-bubble: #2a3a5c;
+    --bot-bubble: #1e2230;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--text); height: 100vh; display: flex;
+  }
+  #sidebar {
+    width: 300px; background: var(--panel); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; padding: 20px; gap: 16px;
+  }
+  #sidebar h1 { font-size: 18px; margin: 0 0 4px; }
+  #sidebar .sub { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  .upload-box {
+    border: 1.5px dashed var(--border); border-radius: 10px; padding: 18px;
+    text-align: center; cursor: pointer; font-size: 13px; color: var(--muted);
+    transition: border-color .15s;
+  }
+  .upload-box:hover, .upload-box.dragover { border-color: var(--accent); color: var(--text); }
+  #fileInput { display: none; }
+  #docList { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .doc-item {
+    background: var(--bot-bubble); border-radius: 8px; padding: 10px 12px;
+    font-size: 13px; display: flex; justify-content: space-between; align-items: center;
+    gap: 8px;
+  }
+  .doc-item .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .doc-item .meta { color: var(--muted); font-size: 11px; }
+  .doc-item button {
+    background: none; border: none; color: var(--muted); cursor: pointer; font-size: 15px;
+    padding: 2px 6px;
+  }
+  .doc-item button:hover { color: #e05c5c; }
+  #status { font-size: 11px; color: var(--muted); border-top: 1px solid var(--border); padding-top: 10px; }
+
+  #main { flex: 1; display: flex; flex-direction: column; }
+  #chat { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+  .msg { max-width: 70%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; }
+  .msg.user { align-self: flex-end; background: var(--user-bubble); }
+  .msg.bot { align-self: flex-start; background: var(--bot-bubble); }
+  .sources { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+  .source-chip {
+    background: var(--accent-dim); border-radius: 8px; padding: 8px 10px; font-size: 12px; color: var(--muted);
+  }
+  .source-chip .head { color: var(--text); font-weight: 600; margin-bottom: 2px; }
+  #inputBar { display: flex; gap: 10px; padding: 16px 24px; border-top: 1px solid var(--border); }
+  #queryInput {
+    flex: 1; background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; color: var(--text); font-size: 14px; resize: none;
+  }
+  #sendBtn {
+    background: var(--accent); border: none; color: white; border-radius: 10px;
+    padding: 0 20px; cursor: pointer; font-size: 14px; font-weight: 600;
+  }
+  #sendBtn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .empty { color: var(--muted); margin: auto; text-align: center; font-size: 14px; }
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+  <div>
+    <h1>DocMind</h1>
+    <div class="sub">RAG document intelligence pipeline</div>
+  </div>
+
+  <label class="upload-box" id="uploadBox" for="fileInput">
+    Drop a PDF, TXT, or MD file here<br>or click to browse
+  </label>
+  <input type="file" id="fileInput" accept=".pdf,.txt,.md">
+
+  <div id="docList"></div>
+
+  <div id="status">Checking status…</div>
+</div>
+
+<div id="main">
+  <div id="chat">
+    <div class="empty">Upload a document, then ask a question about it. Answers are grounded in the source material with citations.</div>
+  </div>
+  <div id="inputBar">
+    <textarea id="queryInput" rows="1" placeholder="Ask a question about your documents..."></textarea>
+    <button id="sendBtn">Send</button>
+  </div>
+</div>
+
+<script>
+const chat = document.getElementById('chat');
+const queryInput = document.getElementById('queryInput');
+const sendBtn = document.getElementById('sendBtn');
+const fileInput = document.getElementById('fileInput');
+const uploadBox = document.getElementById('uploadBox');
+const docList = document.getElementById('docList');
+const statusEl = document.getElementById('status');
+
+let history = [];
+let selectedDocFilter = null;
+
+async function refreshHealth() {
+  try {
+    const r = await fetch('/api/health');
+    const d = await r.json();
+    statusEl.textContent = `${d.documents} doc(s), ${d.chunks} chunks · ${d.llm}`;
+  } catch (e) {
+    statusEl.textContent = 'Backend unreachable';
+  }
+}
+
+async function refreshDocs() {
+  const r = await fetch('/api/documents');
+  const d = await r.json();
+  docList.innerHTML = '';
+  (d.documents || []).forEach(doc => {
+    const el = document.createElement('div');
+    el.className = 'doc-item';
+    el.innerHTML = `
+      <div>
+        <div class="name">${doc.doc_name}</div>
+        <div class="meta">${doc.chunk_count} chunks</div>
+      </div>
+      <button title="Delete">&times;</button>`;
+    el.querySelector('button').onclick = async () => {
+      await fetch('/api/documents/' + encodeURIComponent(doc.doc_name), { method: 'DELETE' });
+      refreshDocs(); refreshHealth();
+    };
+    docList.appendChild(el);
+  });
+}
+
+async function uploadFile(file) {
+  const fd = new FormData();
+  fd.append('file', file);
+  uploadBox.textContent = 'Uploading & ingesting...';
+  try {
+    const r = await fetch('/api/upload', { method: 'POST', body: fd });
+    const d = await r.json();
+    if (d.status === 'error') throw new Error(d.message);
+  } catch (e) {
+    alert('Upload failed: ' + e.message);
+  }
+  uploadBox.innerHTML = 'Drop a PDF, TXT, or MD file here<br>or click to browse';
+  refreshDocs(); refreshHealth();
+}
+
+fileInput.addEventListener('change', e => { if (e.target.files[0]) uploadFile(e.target.files[0]); });
+uploadBox.addEventListener('dragover', e => { e.preventDefault(); uploadBox.classList.add('dragover'); });
+uploadBox.addEventListener('dragleave', () => uploadBox.classList.remove('dragover'));
+uploadBox.addEventListener('drop', e => {
+  e.preventDefault(); uploadBox.classList.remove('dragover');
+  if (e.dataTransfer.files[0]) uploadFile(e.dataTransfer.files[0]);
+});
+
+function addMessage(role, text, sources) {
+  const empty = chat.querySelector('.empty');
+  if (empty) empty.remove();
+  const el = document.createElement('div');
+  el.className = 'msg ' + (role === 'user' ? 'user' : 'bot');
+  el.textContent = text;
+  if (sources && sources.length) {
+    const sw = document.createElement('div');
+    sw.className = 'sources';
+    sources.forEach(s => {
+      const chip = document.createElement('div');
+      chip.className = 'source-chip';
+      chip.innerHTML = `<div class="head">${s.doc_name} · chunk ${s.chunk_index} · score ${s.score}</div>${s.excerpt}`;
+      sw.appendChild(chip);
+    });
+    el.appendChild(sw);
+  }
+  chat.appendChild(el);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+async function sendQuery() {
+  const query = queryInput.value.trim();
+  if (!query) return;
+  addMessage('user', query);
+  history.push({ role: 'user', content: query });
+  queryInput.value = '';
+  sendBtn.disabled = true;
+
+  try {
+    const r = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, doc_filter: selectedDocFilter, history })
+    });
+    const d = await r.json();
+    if (d.status === 'error') throw new Error(d.message);
+    addMessage('bot', d.answer, d.sources);
+    history.push({ role: 'assistant', content: d.answer });
+  } catch (e) {
+    addMessage('bot', 'Error: ' + e.message);
+  }
+  sendBtn.disabled = false;
+}
+
+sendBtn.addEventListener('click', sendQuery);
+queryInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendQuery(); }
+});
+
+refreshHealth();
+refreshDocs();
+</script>
+</body>
+</html>
