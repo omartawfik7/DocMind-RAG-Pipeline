@@ -68,7 +68,14 @@ def get_embedder() -> TextEmbedding:
 
 
 def get_collection() -> QdrantClient:
-    """Returns a ready Qdrant client with the collection created if needed."""
+    """Returns a ready Qdrant client with the collection and required
+    payload indexes created if needed.
+
+    Qdrant Cloud (unlike local/in-memory Qdrant) requires an explicit
+    payload index on any field used in a filter -- without it, filtered
+    queries (like the duplicate-detection check on file_hash, or the
+    doc_name filter used by retrieve/delete) return a 400 error.
+    """
     global _qdrant_client
     if _qdrant_client is None:
         _qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
@@ -77,6 +84,14 @@ def get_collection() -> QdrantClient:
             _qdrant_client.create_collection(
                 collection_name=COLLECTION_NAME,
                 vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+            )
+        # Required for filtering on Qdrant Cloud -- safe to call even if
+        # the index already exists (Qdrant no-ops on a duplicate request).
+        for field in ("file_hash", "doc_name"):
+            _qdrant_client.create_payload_index(
+                collection_name=COLLECTION_NAME,
+                field_name=field,
+                field_schema="keyword",
             )
     return _qdrant_client
 
