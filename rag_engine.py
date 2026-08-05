@@ -6,7 +6,7 @@ Document ingestion -> chunking -> embedding -> vector store -> retrieval
 Pipeline:
   1. PDF/TXT ingestion via PyPDF2
   2. Recursive text chunking with overlap
-  3. Sentence-transformers embedding (all-MiniLM-L6-v2)
+  3. fastembed (ONNX Runtime) embedding -- all-MiniLM-L6-v2, no PyTorch dependency
   4. Qdrant Cloud vector store (persistent, hosted -- free tier)
   5. Cosine similarity retrieval
   6. Groq (Llama 3.3 70B) answer generation with citations
@@ -31,12 +31,12 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 )
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 import PyPDF2
 from groq import Groq
 
 # -- Config ------------------------------------------------------
-EMBED_MODEL     = "all-MiniLM-L6-v2"
+EMBED_MODEL     = "sentence-transformers/all-MiniLM-L6-v2"  # served via fastembed (ONNX), not PyTorch -- keeps memory low on free-tier hosts
 EMBED_DIM       = 384       # output dimension of all-MiniLM-L6-v2
 CHUNK_SIZE      = 512       # characters per chunk
 CHUNK_OVERLAP   = 80        # overlap between chunks
@@ -55,15 +55,15 @@ QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
 _groq_client = Groq(api_key=GROQ_API_KEY)
 
 # -- Singleton client/model loaders -------------------------------
-_embedder: Optional[SentenceTransformer] = None
+_embedder: Optional[TextEmbedding] = None
 _qdrant_client: Optional[QdrantClient] = None
 
 
-def get_embedder() -> SentenceTransformer:
+def get_embedder() -> TextEmbedding:
     global _embedder
     if _embedder is None:
         print("Loading embedding model (first run only)...")
-        _embedder = SentenceTransformer(EMBED_MODEL)
+        _embedder = TextEmbedding(model_name=EMBED_MODEL)
     return _embedder
 
 
@@ -222,7 +222,7 @@ def ingest_document(filepath: str, doc_name: str) -> dict:
 
     print(f"  Embedding {len(chunks)} chunks...")
     texts      = [c["text"] for c in chunks]
-    embeddings = embedder.encode(texts, show_progress_bar=False).tolist()
+    embeddings = [emb.tolist() for emb in embedder.embed(texts)]
 
     doc_id = str(uuid.uuid4())[:8]
     points = []
@@ -267,7 +267,7 @@ def retrieve(query: str, top_k: int = TOP_K,
     client   = get_collection()
     embedder = get_embedder()
 
-    query_embedding = embedder.encode([query]).tolist()[0]
+    query_embedding = next(embedder.embed([query])).tolist()
 
     qfilter = None
     if doc_filter:
