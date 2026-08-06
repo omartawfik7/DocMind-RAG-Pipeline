@@ -71,14 +71,22 @@ def get_collection() -> QdrantClient:
     """Returns a ready Qdrant client with the collection and required
     payload indexes created if needed.
 
-    Qdrant Cloud (unlike local/in-memory Qdrant) requires an explicit
+    Explicitly connects over port 443 (standard HTTPS) rather than
+    Qdrant's default gRPC-adjacent port 6333 -- some networks (school,
+    corporate, certain ISPs/routers) block outbound traffic on
+    non-standard ports like 6333 while leaving 443 wide open, since
+    443 is required for essentially all web browsing to work at all.
+    Qdrant Cloud's REST API is fully available over 443, so this avoids
+    the problem without needing any network/firewall changes.
+
+    Qdrant Cloud (unlike local/in-memory Qdrant) also requires an explicit
     payload index on any field used in a filter -- without it, filtered
     queries (like the duplicate-detection check on file_hash, or the
     doc_name filter used by retrieve/delete) return a 400 error.
     """
     global _qdrant_client
     if _qdrant_client is None:
-        _qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        _qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, port=443)
         existing = {c.name for c in _qdrant_client.get_collections().collections}
         if COLLECTION_NAME not in existing:
             _qdrant_client.create_collection(
