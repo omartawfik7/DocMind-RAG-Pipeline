@@ -12,6 +12,7 @@ Endpoints:
 
 import os
 import traceback
+import uuid
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()  # no-op if .env doesn't exist (e.g. on Render, where env vars are injected directly)
@@ -20,10 +21,12 @@ from flask import Flask, jsonify, request, render_template, session
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from rag_engine import (
-    ingest_document, retrieve, generate_answer,
+    ingest_document,
     list_documents, delete_document, get_collection, collection_count,
     GROQ_MODEL, EMBED_MODEL,
 )
+import config
+from agents.supervisor import supervisor
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "rag-dev-secret-change-in-prod")
@@ -61,6 +64,7 @@ def health():
             "chunks":      chunk_count,
             "embed_model": EMBED_MODEL,
             "llm":         GROQ_MODEL,
+            "provider":    config.LLM_PROVIDER,
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -100,22 +104,27 @@ def chat():
     if not query:
         return jsonify({"error": "No query provided"}), 400
 
-    try:
-        chunks = retrieve(query, doc_filter=doc_filter)
-        if not chunks:
-            return jsonify({
-                "status": "ok",
-                "answer": "No documents have been uploaded yet. Please upload a PDF or text file first.",
-                "sources": [],
-                "chunks_retrieved": 0,
-            })
+    request_id = str(uuid.uuid4())
 
-        result = generate_answer(query, chunks, chat_history)
+    try:
+        # Everything from here down runs through the Supervisor agent:
+        # input guardrail -> planning -> Retrieval Agent (with indirect
+        # prompt-injection scanning) -> Analysis Agent -> output
+        # validator, all under the circuit breaker's excessive-agency
+        # limits. See agents/supervisor.py.
+        result = supervisor.run(
+            query,
+            doc_filter=doc_filter,
+            chat_history=chat_history,
+            request_id=request_id,
+        )
         return jsonify({
-            "status":           "ok",
+            "status":           result.get("status", "ok"),
             "answer":           result["answer"],
             "sources":          result["sources"],
-            "chunks_retrieved": len(chunks),
+            "chunks_retrieved": result["chunks_retrieved"],
+            "security":         result.get("security"),
+            "run_id":           result.get("run_id"),
         })
 
     except Exception as e:

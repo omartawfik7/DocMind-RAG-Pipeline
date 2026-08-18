@@ -1,0 +1,79 @@
+{
+  "eval_set_size": 10,
+  "top_k": 6,
+  "hit_rate_at_6": 1.0,
+  "mrr": 0.95,
+  "avg_retrieval_latency_ms": 231.6,
+  "cases": [
+    {
+      "question": "How long is the probationary period before someone can request remote work?",
+      "hit": true,
+      "rank": 2,
+      "top_score": 0.6506,
+      "latency_ms": 226.5
+    },
+    {
+      "question": "What equipment does the city provide for remote employees?",
+      "hit": true,
+      "rank": 1,
+      "top_score": 0.5229,
+      "latency_ms": 254.1
+    },
+    {
+      "question": "What internet speed is required for remote work?",
+      "hit": true,
+      "rank": 1,
+      "top_score": 0.4753,
+      "latency_ms": 215.9
+    },
+    {
+      "question": "What are the core hours remote employees must be available?",
+      "hit": true,
+      "rank": 1,
+      "top_score": 0.5839,
+      "latency_ms": 221.7
+    },
+    {
+      "question": "Can remote employees store city data on their personal laptop?",
+      "hit": true,
+      "rank": 1,
+      "top_score": 0.6516,
+      "latency_ms": 245.9
+    },
+    {
+      "question": "How often must managers check in with remote direct reports?",
+      "hit": true,
+      "rank": 1,
+      "top_score": 0.646,
+      "latency_ms": 213.7
+    },
+    {
+      "question": "How much notice does the city give before revoking remote work eligibility?",
+      "hit": true,
+      "rank": 1,
+      "top_score": 0.6863,
+      "latency_ms": 261.9
+    },
+    {
+      "question": "What is the mileage reimbursement rate for remote employee business travel?",
+      "hit": true,
+      "rank": 1,
+      "top_score": 0.7921,
+      "latency_ms": 213.7
+    },
+    {
+      "question": "Do union employees need anything extra for remote work arrangements?",
+      "hit": true,
+      "rank": 1,
+      "top_score": 0.6202,
+      "latency_ms": 242.8
+    },
+    {
+      "question": "Is the internet stipend paid every month?",
+      "hit": true,
+      "rank": 1,
+      "top_score": 0.5168,
+      "latency_ms": 219.9
+    }
+  ]
+}
