@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 uploads/
 chroma_db/
-eval_report.json
 .DS_Store
+logs/*.jsonl
+.pytest_cache/

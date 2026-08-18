@@ -9,7 +9,13 @@ Pipeline:
   3. fastembed (ONNX Runtime) embedding -- all-MiniLM-L6-v2, no PyTorch dependency
   4. Qdrant Cloud vector store (persistent, hosted -- free tier)
   5. Cosine similarity retrieval
-  6. Groq (Llama 3.3 70B) answer generation with citations
+
+Answer generation now lives in agents/analysis_agent.py, behind the
+llm_providers abstraction (Groq by default, or Anthropic/OpenAI via
+LLM_PROVIDER) -- this module owns ingestion, chunking, and retrieval
+only, so it has a single responsibility and eval/eval_retrieval.py's
+existing `from rag_engine import ingest_document, retrieve` keeps
+working unmodified.
 
 Why Qdrant Cloud instead of local ChromaDB:
   Render's free web-service tier does not support persistent disks, so
@@ -33,7 +39,6 @@ from qdrant_client.models import (
 )
 from fastembed import TextEmbedding
 import PyPDF2
-from groq import Groq
 
 # -- Config ------------------------------------------------------
 EMBED_MODEL     = "sentence-transformers/all-MiniLM-L6-v2"  # served via fastembed (ONNX), not PyTorch -- keeps memory low on free-tier hosts
@@ -41,18 +46,21 @@ EMBED_DIM       = 384       # output dimension of all-MiniLM-L6-v2
 CHUNK_SIZE      = 512       # characters per chunk
 CHUNK_OVERLAP   = 80        # overlap between chunks
 TOP_K           = 6         # number of chunks to retrieve
-GROQ_MODEL      = "llama-3.3-70b-versatile"
+GROQ_MODEL      = "openai/gpt-oss-120b"  # default LLM_PROVIDER; see llm_providers.py.
+                                          # NOTE: Groq retired llama-3.3-70b-versatile
+                                          # (the model this repo originally shipped with)
+                                          # since this app was last deployed; this is its
+                                          # current replacement. Override with GROQ_MODEL.
 COLLECTION_NAME = "documents"
 
 # Secrets come from environment variables -- never hardcode API keys.
-# Set GROQ_API_KEY, QDRANT_URL, and QDRANT_API_KEY in your host's
-# environment (locally: a .env file loaded by python-dotenv; on Render:
-# the service's Environment tab).
-GROQ_API_KEY   = os.environ["GROQ_API_KEY"]
+# Set QDRANT_URL and QDRANT_API_KEY in your host's environment (locally:
+# a .env file loaded by python-dotenv; on Render: the service's
+# Environment tab). The LLM provider's own key (GROQ_API_KEY /
+# ANTHROPIC_API_KEY / OPENAI_API_KEY) is read lazily by llm_providers.py,
+# only for whichever provider LLM_PROVIDER selects.
 QDRANT_URL     = os.environ["QDRANT_URL"]
 QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
-
-_groq_client = Groq(api_key=GROQ_API_KEY)
 
 # -- Singleton client/model loaders -------------------------------
 _embedder: Optional[TextEmbedding] = None
@@ -313,77 +321,6 @@ def retrieve(query: str, top_k: int = TOP_K,
         })
 
     return chunks
-
-
-# ==================================================================
-#  ANSWER GENERATION (Groq / Llama 3.3 70B)
-# ==================================================================
-
-SYSTEM_PROMPT = """You are a precise document analyst. You answer questions strictly based on the provided document excerpts.
-
-Rules:
-- Answer only from the provided context. Do not use outside knowledge.
-- If the context doesn't contain enough information, say so clearly.
-- Always cite which document and chunk your answer comes from using [Source: doc_name, Chunk N].
-- Be concise but complete. Use bullet points for multi-part answers.
-- If quoting directly, use quotation marks and cite immediately after.
-"""
-
-def generate_answer(query: str, chunks: list[dict],
-                    chat_history: list[dict] = None) -> dict:
-    """
-    Build context from retrieved chunks -> call Groq -> return answer + sources.
-    """
-    if not chunks:
-        return {
-            "answer":  "No relevant content found in the uploaded documents.",
-            "sources": [],
-        }
-
-    context_parts = []
-    for i, chunk in enumerate(chunks):
-        context_parts.append(
-            f"[Excerpt {i+1} | Source: {chunk['doc_name']}, Chunk {chunk['chunk_index']} | Relevance: {chunk['score']}]\n"
-            f"{chunk['text']}"
-        )
-    context = "\n\n---\n\n".join(context_parts)
-
-    user_message = f"""Document excerpts:
-
-{context}
-
----
-
-Question: {query}"""
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    if chat_history:
-        for turn in chat_history[-6:]:
-            messages.append({"role": turn["role"], "content": turn["content"]})
-    messages.append({"role": "user", "content": user_message})
-
-    response = _groq_client.chat.completions.create(
-        model      = GROQ_MODEL,
-        max_tokens = 1024,
-        messages   = messages,
-    )
-
-    answer = response.choices[0].message.content
-
-    sources = []
-    seen    = set()
-    for chunk in chunks:
-        key = f"{chunk['doc_name']}::{chunk['chunk_index']}"
-        if key not in seen:
-            seen.add(key)
-            sources.append({
-                "doc_name":    chunk["doc_name"],
-                "chunk_index": chunk["chunk_index"],
-                "score":       chunk["score"],
-                "excerpt":     chunk["text"][:200] + "..." if len(chunk["text"]) > 200 else chunk["text"],
-            })
-
-    return {"answer": answer, "sources": sources}
 
 
 # ==================================================================
